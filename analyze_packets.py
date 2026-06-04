@@ -8,6 +8,8 @@ import sys
 import os
 from datetime import datetime
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 
 class PacketAnalyzer:
@@ -23,8 +25,31 @@ class PacketAnalyzer:
         if self.output_format not in ['txt', 'json', 'csv']:
             raise ValueError(f"Invalid format: {output_format}. Use txt, json, or csv.")
 
+    def _parse_chunk(self, lines, cols, start_line):
+        """Parse a chunk of CSV lines."""
+        rows = []
+        skipped = []
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parts = line.split(',')
+                if len(parts) != len(cols):
+                    raise ValueError(f"expected {len(cols)} cols, got {len(parts)}")
+                row = dict(zip(cols, parts))
+                row['timestamp_ns'] = int(row['timestamp_ns'])
+                row['delta_time'] = float(row['delta_time'])
+                row['size'] = int(row['size'])
+                row['src_port'] = int(row['src_port'])
+                row['dst_port'] = int(row['dst_port'])
+                rows.append(row)
+            except Exception as e:
+                skipped.append({'line': start_line + i + 1, 'error': str(e), 'raw': line[:80]})
+        return rows, skipped
+
     def load_data(self):
-        """Load CSV, skip bad rows, report stats."""
+        """Load CSV with parallel chunked parsing."""
         if not os.path.exists(self.csv_path):
             raise FileNotFoundError(f"CSV not found: {self.csv_path}")
 
@@ -37,35 +62,37 @@ class PacketAnalyzer:
             'flags', 'seq_num', 'ack_num'
         ]
 
-        rows = []
         total_lines = sum(1 for _ in open(self.csv_path))
+        chunk_size = max(10000, total_lines // 8)
+        chunks = []
 
-        print(f"Parsing {total_lines} rows...")
         with open(self.csv_path) as f:
-            for i, line in enumerate(tqdm(f, total=total_lines, unit='rows')):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    parts = line.split(',')
-                    if len(parts) != len(cols):
-                        raise ValueError(f"expected {len(cols)} cols, got {len(parts)}")
-                    row = dict(zip(cols, parts))
-                    # type coercion
-                    row['timestamp_ns'] = int(row['timestamp_ns'])
-                    row['delta_time'] = float(row['delta_time'])
-                    row['size'] = int(row['size'])
-                    row['src_port'] = int(row['src_port'])
-                    row['dst_port'] = int(row['dst_port'])
-                    rows.append(row)
-                except Exception as e:
-                    self.skipped_rows += 1
-                    self.skipped_details.append({'line': i + 1, 'error': str(e), 'raw': line[:80]})
+            lines = f.readlines()
 
-        if not rows:
+        for i in range(0, len(lines), chunk_size):
+            chunks.append((lines[i:i+chunk_size], cols, i))
+
+        print(f"Parsing {total_lines} rows with {len(chunks)} parallel chunks...")
+
+        all_rows = []
+        start_time = time.time()
+
+        with ThreadPoolExecutor() as executor:
+            futures = {executor.submit(self._parse_chunk, *chunk): chunk for chunk in chunks}
+            for future in tqdm(as_completed(futures), total=len(chunks), desc="Parsing chunks"):
+                rows, skipped = future.result()
+                all_rows.extend(rows)
+                for s in skipped:
+                    self.skipped_rows += 1
+                    self.skipped_details.append(s)
+
+        if not all_rows:
             raise ValueError("No valid rows parsed")
 
-        self.df = pd.DataFrame(rows)
+        parse_time = time.time() - start_time
+        print(f"Parsed in {parse_time:.2f}s ({len(all_rows)/parse_time:.0f} rows/sec)")
+
+        self.df = pd.DataFrame(all_rows)
         self.df['timestamp'] = pd.to_datetime(self.df['timestamp_ns'], unit='ns')
         self.df['size_kb'] = self.df['size'] / 1024
 
@@ -145,9 +172,36 @@ class PacketAnalyzer:
 
     def run(self):
         self.load_data()
-        print("Running analysis...")
-        for fn in [self.analyze_latency, self.analyze_throughput, self.analyze_tcp_flags, self.analyze_connections, self.analyze_direction]:
-            fn()
+        print("Running parallel analysis...")
+
+        analysis_start = time.time()
+        analyses = [
+            ('latency', self.analyze_latency),
+            ('throughput', self.analyze_throughput),
+            ('tcp_flags', self.analyze_tcp_flags),
+            ('connections', self.analyze_connections),
+            ('direction', self.analyze_direction)
+        ]
+
+        with ThreadPoolExecutor() as executor:
+            futures = {executor.submit(fn): name for name, fn in analyses}
+            completed = 0
+            total = len(analyses)
+
+            for future in tqdm(as_completed(futures), total=total, desc="Analysis"):
+                name = futures[future]
+                try:
+                    future.result()
+                    completed += 1
+                    elapsed = time.time() - analysis_start
+                    eta = (elapsed / completed) * (total - completed) if completed < total else 0
+                    print(f"  ✓ {name} ({elapsed:.1f}s elapsed, ~{eta:.1f}s remaining)")
+                except Exception as e:
+                    print(f"  ✗ {name} failed: {e}")
+
+        analysis_time = time.time() - analysis_start
+        print(f"Analysis complete in {analysis_time:.2f}s")
+
         self.results['meta'] = {
             'input_file': self.csv_path,
             'generated': datetime.now().isoformat(),
