@@ -9,7 +9,7 @@ Deep analysis of nginx packet capture (`fcap.csv`).
 
 ## Run
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip3 install -r requirements.txt
 python3 analyze_packets.py fcap.csv
