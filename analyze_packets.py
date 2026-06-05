@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Deep packet analysis for nginx capture CSV. Supports txt, json, csv output."""
+
+import pandas as pd
+import numpy as np
+import json
+import sys
+import os
+from datetime import datetime
+from tqdm import tqdm
+
+
+class PacketAnalyzer:
+    def __init__(self, csv_path, output_format='txt', output_file=None):
+        self.csv_path = csv_path
+        self.output_format = output_format.lower()
+        self.output_file = output_file
+        self.results = {}
+        self.df = None
+        self.skipped_rows = 0
+        self.skipped_details = []
+
+        if self.output_format not in ['txt', 'json', 'csv']:
+            raise ValueError(f"Invalid format: {output_format}. Use txt, json, or csv.")
+
+    def load_data(self):
+        """Load CSV, skip bad rows, report stats."""
+        if not os.path.exists(self.csv_path):
+            raise FileNotFoundError(f"CSV not found: {self.csv_path}")
+
+        if os.path.getsize(self.csv_path) == 0:
+            raise ValueError("CSV file is empty")
+
+        cols = [
+            'seq', 'col1', 'col2', 'timestamp_ns', 'rel_time', 'delta_time',
+            'src_ip', 'dst_ip', 'size', 'proto', 'src_port', 'dst_port',
+            'flags', 'seq_num', 'ack_num'
+        ]
+
+        rows = []
+        total_lines = sum(1 for _ in open(self.csv_path))
+
+        print(f"Parsing {total_lines} rows...")
+        with open(self.csv_path) as f:
+            for i, line in enumerate(tqdm(f, total=total_lines, unit='rows')):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parts = line.split(',')
+                    if len(parts) != len(cols):
+                        raise ValueError(f"expected {len(cols)} cols, got {len(parts)}")
+                    row = dict(zip(cols, parts))
+                    # type coercion
+                    row['timestamp_ns'] = int(row['timestamp_ns'])
+                    row['delta_time'] = float(row['delta_time'])
+                    row['size'] = int(row['size'])
+                    row['src_port'] = int(row['src_port'])
+                    row['dst_port'] = int(row['dst_port'])
+                    rows.append(row)
+                except Exception as e:
+                    self.skipped_rows += 1
+                    self.skipped_details.append({'line': i + 1, 'error': str(e), 'raw': line[:80]})
+
+        if not rows:
+            raise ValueError("No valid rows parsed")
+
+        self.df = pd.DataFrame(rows)
+        self.df['timestamp'] = pd.to_datetime(self.df['timestamp_ns'], unit='ns')
+        self.df['size_kb'] = self.df['size'] / 1024
+
+        required = ['timestamp_ns', 'delta_time', 'size', 'src_ip', 'dst_ip', 'flags']
+        missing = [c for c in required if c not in self.df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns after cleaning: {missing}")
+
+    def analyze_latency(self):
+        delta = self.df['delta_time']
+        stats = delta.describe()
+        self.results['latency'] = {
+            'mean': round(float(stats['mean']), 2),
+            'median': round(float(stats['50%']), 2),
+            'std': round(float(stats['std']), 2),
+            'min': round(float(stats['min']), 2),
+            'max': round(float(stats['max']), 2),
+            'p95': round(float(delta.quantile(0.95)), 2),
+            'p99': round(float(delta.quantile(0.99)), 2),
+            'burst_count': int((delta < 0.0001).sum()),
+            'burst_pct': round(float((delta < 0.0001).sum() / len(delta) * 100), 2)
+        }
+
+    def analyze_traffic_categories(self):
+        """Categorize traffic into handshake, connection, data transfer, and control."""
+        total_bytes = int(self.df['size'].sum())
+
+        # Handshake: SYN, SYN-ACK, ACK sequences
+        handshake_flags = ['SYN', 'SYN-ACK']
+        handshake_mask = self.df['flags'].isin(handshake_flags)
+        handshake_bytes = int(self.df[handshake_mask]['size'].sum())
+
+        # Connection establishment: contains SYN or ACK with small sizes (< 100 bytes typically)
+        connection_mask = (self.df['flags'].str.contains('SYN', na=False) |
+                          ((self.df['flags'] == 'ACK') & (self.df['size'] < 100)))
+        connection_bytes = int(self.df[connection_mask]['size'].sum())
+
+        # Data transfer: PSH flag or larger packets (> 100 bytes with ACK)
+        data_mask = (self.df['flags'].str.contains('PSH', na=False) |
+                    ((self.df['size'] >= 100) & ~self.df['flags'].str.contains('SYN', na=False)))
+        data_bytes = int(self.df[data_mask]['size'].sum())
+
+        # Control traffic: pure ACKs, FIN, RST, and other control packets
+        control_mask = (self.df['flags'].isin(['ACK', 'FIN', 'RST', 'FIN-ACK', 'RST-ACK']) &
+                       (self.df['size'] < 100))
+        control_bytes = int(self.df[control_mask]['size'].sum())
+
+        # Adjust to ensure total adds up (handle overlaps)
+        categorized_bytes = handshake_bytes + data_bytes + control_bytes
+        connection_bytes = min(connection_bytes, total_bytes - categorized_bytes + connection_bytes)
+
+        # Calculate percentages
+        if total_bytes > 0:
+            handshake_pct = round((handshake_bytes / total_bytes) * 100, 2)
+            connection_pct = round((connection_bytes / total_bytes) * 100, 2)
+            data_pct = round((data_bytes / total_bytes) * 100, 2)
+            control_pct = round((control_bytes / total_bytes) * 100, 2)
+        else:
+            handshake_pct = connection_pct = data_pct = control_pct = 0.0
+
+        self.results['traffic_categories'] = {
+            'handshake': {'bytes': handshake_bytes, 'pct': handshake_pct},
+            'connection': {'bytes': connection_bytes, 'pct': connection_pct},
+            'data_transfer': {'bytes': data_bytes, 'pct': data_pct},
+            'control': {'bytes': control_bytes, 'pct': control_pct},
+            'total_bytes': total_bytes
+        }
+
+    def analyze_throughput(self):
+        total_bytes = int(self.df['size'].sum())
+        total_mb = total_bytes / (1024 * 1024)
+        time_span = (self.df['timestamp'].max() - self.df['timestamp'].min()).total_seconds() or 0.000001
+        self.results['throughput'] = {
+            'total_packets': int(len(self.df)),
+            'total_bytes': total_bytes,
+            'total_mb': round(total_mb, 2),
+            'capture_span_s': round(time_span, 2),
+            'throughput_mbps': round(total_mb / time_span * 8, 2),
+            'pps': int(len(self.df) / time_span),
+            'peak_100ms_kb': round(self.df.set_index('timestamp').rolling('100ms')['size'].sum().max() / 1024, 2)
+        }
+
+    def analyze_tcp_flags(self):
+        flag_counts = self.df['flags'].value_counts().to_dict()
+        pct = {k: round(v / len(self.df) * 100, 2) for k, v in flag_counts.items()}
+        psh = self.df[self.df['flags'].str.contains('PSH', na=False)]
+        ack_only = self.df[self.df['flags'] == 'ACK']
+        self.results['tcp_flags'] = {
+            'flag_counts': flag_counts,
+            'flag_pct': pct,
+            'psh_count': int(len(psh)),
+            'psh_pct': round(len(psh) / len(self.df) * 100, 2),
+            'psh_avg_size': round(psh['size'].mean(), 1) if len(psh) else 0,
+            'ack_only_count': int(len(ack_only)),
+            'ack_only_pct': round(len(ack_only) / len(self.df) * 100, 2)
+        }
+
+    def analyze_connections(self):
+        self.df['flow'] = self.df.apply(
+            lambda r: tuple(sorted([f"{r['src_ip']}:{r['src_port']}", f"{r['dst_ip']}:{r['dst_port']}"])), axis=1
+        )
+        flows = self.df.groupby('flow').agg({'size': ['count', 'sum'], 'timestamp': ['min', 'max']})
+        flows.columns = ['packets', 'bytes', 'start', 'end']
+        flows['duration'] = (flows['end'] - flows['start']).dt.total_seconds()
+        flows['pps'] = flows['packets'] / flows['duration'].replace(0, 0.001)
+        top = flows.nlargest(5, 'bytes')
+        top_flows = [{'flow': f"{flow[0]} <-> {flow[1]}", 'packets': int(row['packets']), 'bytes_kb': round(row['bytes'] / 1024, 1)} for flow, row in top.iterrows()]
+        self.results['connections'] = {
+            'unique_flows': int(len(flows)),
+            'mean_duration_s': round(flows['duration'].mean(), 6),
+            'max_duration_s': round(flows['duration'].max(), 6),
+            'mean_packets': round(flows['packets'].mean(), 1),
+            'max_packets': int(flows['packets'].max()),
+            'top_5_flows': top_flows
+        }
+
+    def analyze_direction(self):
+        pairs = self.df.groupby(['src_ip', 'dst_ip']).agg({'size': ['count', 'sum']})
+        pairs.columns = ['packets', 'bytes']
+        pairs = pairs.sort_values('bytes', ascending=False)
+        self.results['direction'] = {'ip_pairs': [{'src': src, 'dst': dst, 'packets': int(row['packets']), 'bytes_kb': round(row['bytes'] / 1024, 1)} for (src, dst), row in pairs.iterrows()]}
+
+    def run(self):
+        self.load_data()
+        print("Running analysis...")
+        for fn in [self.analyze_latency, self.analyze_traffic_categories, self.analyze_throughput, self.analyze_tcp_flags, self.analyze_connections, self.analyze_direction]:
+            fn()
+        self.results['meta'] = {
+            'input_file': self.csv_path,
+            'generated': datetime.now().isoformat(),
+            'packet_count': int(len(self.df)),
+            'skipped_rows': self.skipped_rows,
+            'skipped_details': self.skipped_details
+        }
+
+    def output(self):
+        if self.output_format == 'json':
+            content = json.dumps(self.results, indent=2)
+        elif self.output_format == 'csv':
+            rows = []
+            for section, data in self.results.items():
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if isinstance(v, (int, float, str)):
+                            rows.append({'section': section, 'metric': k, 'value': v})
+            content = pd.DataFrame(rows).to_csv(index=False)
+        else:
+            lines = [f"Packet Analysis — {self.results['meta']['input_file']}\n"]
+            for section, data in self.results.items():
+                if section == 'meta':
+                    continue
+                lines.append(f"\n{'='*50}\n{section.upper()}\n{'='*50}")
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if isinstance(v, list):
+                            lines.append(f"{k}:")
+                            for item in v:
+                                lines.append(f"  {item}")
+                        else:
+                            lines.append(f"{k}: {v}")
+            if self.skipped_rows:
+                lines.append(f"\n{'='*50}\nSKIPPED ROWS\n{'='*50}")
+                lines.append(f"Total skipped: {self.skipped_rows}")
+                for d in self.skipped_details[:10]:
+                    lines.append(f"  line {d['line']}: {d['error']} | {d['raw']}")
+                if len(self.skipped_details) > 10:
+                    lines.append(f"  ... and {len(self.skipped_details)-10} more")
+            content = '\n'.join(lines)
+
+        if self.output_file:
+            with open(self.output_file, 'w') as f:
+                f.write(content)
+            print(f"Written: {self.output_file}")
+        else:
+            print(content)
+
+
+def print_help():
+    print("""analyze_packets.py — deep nginx packet capture analyzer
+
+USAGE:
+  python analyze_packets.py <csv>                    # default txt output
+  python analyze_packets.py <csv> txt                # explicit txt
+  python analyze_packets.py <csv> json               # json to stdout
+  python analyze_packets.py <csv> csv                # csv to stdout
+  python analyze_packets.py <csv> json out.json      # json to file
+  python analyze_packets.py <csv> csv  out.csv       # csv to file
+  python analyze_packets.py <csv> txt  out.txt       # txt to file
+  python analyze_packets.py -h|--help                # this help
+
+ARGUMENTS:
+  <csv>       input packet capture CSV (required)
+  [format]    txt | json | csv   (default: txt)
+  [output]    optional filename; if omitted, prints to stdout
+
+DESCRIPTION:
+  Parses CSV, skips malformed rows, reports skipped-row stats,
+  computes latency/throughput/TCP-flags/connection/direction metrics,
+  and emits results in the requested format.""")
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
+        print_help()
+        sys.exit(0)
+
+    csv_path = sys.argv[1]
+    fmt = sys.argv[2] if len(sys.argv) > 2 else 'txt'
+    out = sys.argv[3] if len(sys.argv) > 3 else None
+
+    try:
+        analyzer = PacketAnalyzer(csv_path, fmt, out)
+        analyzer.run()
+        analyzer.output()
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        sys.exit(2)
+
+
+if __name__ == '__main__':
+    main()
