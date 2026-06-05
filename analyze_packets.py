@@ -78,15 +78,60 @@ class PacketAnalyzer:
         delta = self.df['delta_time']
         stats = delta.describe()
         self.results['latency'] = {
-            'mean': float(stats['mean']),
-            'median': float(stats['50%']),
-            'std': float(stats['std']),
-            'min': float(stats['min']),
-            'max': float(stats['max']),
-            'p95': float(delta.quantile(0.95)),
-            'p99': float(delta.quantile(0.99)),
+            'mean': round(float(stats['mean']), 2),
+            'median': round(float(stats['50%']), 2),
+            'std': round(float(stats['std']), 2),
+            'min': round(float(stats['min']), 2),
+            'max': round(float(stats['max']), 2),
+            'p95': round(float(delta.quantile(0.95)), 2),
+            'p99': round(float(delta.quantile(0.99)), 2),
             'burst_count': int((delta < 0.0001).sum()),
-            'burst_pct': float((delta < 0.0001).sum() / len(delta) * 100)
+            'burst_pct': round(float((delta < 0.0001).sum() / len(delta) * 100), 2)
+        }
+
+    def analyze_traffic_categories(self):
+        """Categorize traffic into handshake, connection, data transfer, and control."""
+        total_bytes = int(self.df['size'].sum())
+
+        # Handshake: SYN, SYN-ACK, ACK sequences
+        handshake_flags = ['SYN', 'SYN-ACK']
+        handshake_mask = self.df['flags'].isin(handshake_flags)
+        handshake_bytes = int(self.df[handshake_mask]['size'].sum())
+
+        # Connection establishment: contains SYN or ACK with small sizes (< 100 bytes typically)
+        connection_mask = (self.df['flags'].str.contains('SYN', na=False) |
+                          ((self.df['flags'] == 'ACK') & (self.df['size'] < 100)))
+        connection_bytes = int(self.df[connection_mask]['size'].sum())
+
+        # Data transfer: PSH flag or larger packets (> 100 bytes with ACK)
+        data_mask = (self.df['flags'].str.contains('PSH', na=False) |
+                    ((self.df['size'] >= 100) & ~self.df['flags'].str.contains('SYN', na=False)))
+        data_bytes = int(self.df[data_mask]['size'].sum())
+
+        # Control traffic: pure ACKs, FIN, RST, and other control packets
+        control_mask = (self.df['flags'].isin(['ACK', 'FIN', 'RST', 'FIN-ACK', 'RST-ACK']) &
+                       (self.df['size'] < 100))
+        control_bytes = int(self.df[control_mask]['size'].sum())
+
+        # Adjust to ensure total adds up (handle overlaps)
+        categorized_bytes = handshake_bytes + data_bytes + control_bytes
+        connection_bytes = min(connection_bytes, total_bytes - categorized_bytes + connection_bytes)
+
+        # Calculate percentages
+        if total_bytes > 0:
+            handshake_pct = round((handshake_bytes / total_bytes) * 100, 2)
+            connection_pct = round((connection_bytes / total_bytes) * 100, 2)
+            data_pct = round((data_bytes / total_bytes) * 100, 2)
+            control_pct = round((control_bytes / total_bytes) * 100, 2)
+        else:
+            handshake_pct = connection_pct = data_pct = control_pct = 0.0
+
+        self.results['traffic_categories'] = {
+            'handshake': {'bytes': handshake_bytes, 'pct': handshake_pct},
+            'connection': {'bytes': connection_bytes, 'pct': connection_pct},
+            'data_transfer': {'bytes': data_bytes, 'pct': data_pct},
+            'control': {'bytes': control_bytes, 'pct': control_pct},
+            'total_bytes': total_bytes
         }
 
     def analyze_throughput(self):
@@ -96,8 +141,8 @@ class PacketAnalyzer:
         self.results['throughput'] = {
             'total_packets': int(len(self.df)),
             'total_bytes': total_bytes,
-            'total_mb': round(total_mb, 4),
-            'capture_span_s': round(time_span, 6),
+            'total_mb': round(total_mb, 2),
+            'capture_span_s': round(time_span, 2),
             'throughput_mbps': round(total_mb / time_span * 8, 2),
             'pps': int(len(self.df) / time_span),
             'peak_100ms_kb': round(self.df.set_index('timestamp').rolling('100ms')['size'].sum().max() / 1024, 2)
@@ -146,7 +191,7 @@ class PacketAnalyzer:
     def run(self):
         self.load_data()
         print("Running analysis...")
-        for fn in [self.analyze_latency, self.analyze_throughput, self.analyze_tcp_flags, self.analyze_connections, self.analyze_direction]:
+        for fn in [self.analyze_latency, self.analyze_traffic_categories, self.analyze_throughput, self.analyze_tcp_flags, self.analyze_connections, self.analyze_direction]:
             fn()
         self.results['meta'] = {
             'input_file': self.csv_path,
