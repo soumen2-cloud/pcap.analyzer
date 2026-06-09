@@ -135,17 +135,43 @@ class PacketAnalyzer:
         }
 
     def analyze_throughput(self):
-        total_bytes = int(self.df['size'].sum())
-        total_mb = total_bytes / (1024 * 1024)
+        # Data packets: PSH flag or larger packets without SYN
+        data_mask = (self.df['flags'].str.contains('PSH', na=False) |
+                    ((self.df['size'] >= 100) & ~self.df['flags'].str.contains('SYN', na=False)))
+        data_df = self.df[data_mask]
+
+        # Calculate data bytes (Ethernet frame minus 4-byte FCS)
+        # Assuming size field contains Ethernet frame size, subtract FCS
+        data_bytes_raw = int(data_df['size'].sum())  # raw captured bytes
+        data_bytes_no_fcs = data_bytes_raw - (len(data_df) * 4)  # subtract 4-byte FCS per frame
+
+        # IP header is 20 bytes (assuming no options)
+        ip_header_bytes = len(data_df) * 20
+        data_bytes_with_ip = data_bytes_no_fcs
+        data_bytes_without_ip = data_bytes_no_fcs - ip_header_bytes
+
+        # Calculate interframe gaps (average time between consecutive packets)
+        sorted_df = self.df.sort_values('timestamp_ns')
+        time_diffs = sorted_df['timestamp_ns'].diff().dropna() / 1e9  # convert ns to seconds
+        avg_ifg_us = round(time_diffs.mean() * 1e6, 2) if len(time_diffs) > 0 else 0
+
         time_span = (self.df['timestamp'].max() - self.df['timestamp'].min()).total_seconds() or 0.000001
+
         self.results['throughput'] = {
             'total_packets': int(len(self.df)),
-            'total_bytes': total_bytes,
-            'total_mb': round(total_mb, 2),
+            'data_packets': int(len(data_df)),
             'capture_span_s': round(time_span, 2),
-            'throughput_mbps': round(total_mb / time_span * 8, 2),
+            'data_bytes_raw': data_bytes_raw,
+            'data_bytes_no_fcs': data_bytes_no_fcs,
+            'data_bytes_with_ip': data_bytes_with_ip,
+            'data_bytes_without_ip': max(0, data_bytes_without_ip),
+            'throughput_raw_mbps': round(data_bytes_raw / time_span / (1024*1024) * 8, 2),
+            'throughput_no_fcs_mbps': round(data_bytes_no_fcs / time_span / (1024*1024) * 8, 2),
+            'throughput_with_ip_mbps': round(data_bytes_with_ip / time_span / (1024*1024) * 8, 2),
+            'throughput_without_ip_mbps': round(max(0, data_bytes_without_ip) / time_span / (1024*1024) * 8, 2),
             'pps': int(len(self.df) / time_span),
-            'peak_100ms_kb': round(self.df.set_index('timestamp').rolling('100ms')['size'].sum().max() / 1024, 2)
+            'peak_100ms_kb': round(self.df.set_index('timestamp').rolling('100ms')['size'].sum().max() / 1024, 2),
+            'avg_interframe_gap_us': avg_ifg_us
         }
 
     def analyze_tcp_flags(self):
