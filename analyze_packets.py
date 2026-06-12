@@ -107,7 +107,7 @@ class PacketAnalyzer:
             'delta_time_p99_ns': round(float(delta.quantile(0.99)) * 1e9, 2),
             'application_latency_mean_ns': round(float(app_latency_ns), 2),
             'burst_count': int((delta < 0.0001).sum()),
-            'burst_pct': round(float((delta < 0.0001).sum() / len(delta) * 100), 2)
+            'burst_percentage': round(float((delta < 0.0001).sum() / len(delta) * 100), 2)
         }
 
     def analyze_traffic_categories(self):
@@ -145,18 +145,18 @@ class PacketAnalyzer:
 
         # Calculate percentages
         if total_bytes > 0:
-            handshake_pct = round((handshake_bytes / total_bytes) * 100, 2)
-            connection_pct = round((connection_bytes / total_bytes) * 100, 2)
-            data_pct = round((data_bytes / total_bytes) * 100, 2)
-            control_pct = round((control_bytes / total_bytes) * 100, 2)
+            handshake_percentage = round((handshake_bytes / total_bytes) * 100, 2)
+            connection_percentage = round((connection_bytes / total_bytes) * 100, 2)
+            data_percentage = round((data_bytes / total_bytes) * 100, 2)
+            control_percentage = round((control_bytes / total_bytes) * 100, 2)
         else:
-            handshake_pct = connection_pct = data_pct = control_pct = 0.0
+            handshake_percentage = connection_percentage = data_percentage = control_percentage = 0.0
 
         self.results['traffic_categories'] = {
-            'handshake': {'bytes': handshake_bytes, 'pct': handshake_pct},
-            'connection': {'bytes': connection_bytes, 'pct': connection_pct},
-            'data_transfer': {'bytes': data_bytes, 'pct': data_pct},
-            'control': {'bytes': control_bytes, 'pct': control_pct},
+            'handshake': {'bytes': handshake_bytes, 'percentage': handshake_percentage},
+            'connection': {'bytes': connection_bytes, 'percentage': connection_percentage},
+            'data_transfer': {'bytes': data_bytes, 'percentage': data_percentage},
+            'control': {'bytes': control_bytes, 'percentage': control_percentage},
             'total_bytes': total_bytes
         }
 
@@ -209,17 +209,52 @@ class PacketAnalyzer:
         # Identifies PSH (data push) and ACK-only packets
         # Calculates average sizes for data and control packets
         flag_counts = self.df['flags'].value_counts()
-        pct = {k: round(v / len(self.df) * 100, 2) for k, v in flag_counts.items()}
+        percentage = {k: round(v / len(self.df) * 100, 2) for k, v in flag_counts.items()}
         psh = self.df[self.df['flags'].str.contains('PSH', na=False)]
         ack_only = self.df[self.df['flags'] == 'ACK']
         self.results['tcp_flags'] = {
             'flag_counts': flag_counts.to_dict(),
-            'flag_pct': pct,
+            'flag_percentage': percentage,
             'psh_count': int(len(psh)),
-            'psh_pct': round(len(psh) / len(self.df) * 100, 2),
+            'psh_percentage': round(len(psh) / len(self.df) * 100, 2),
             'psh_avg_size': round(psh['size'].mean(), 1) if len(psh) else 0,
             'ack_only_count': int(len(ack_only)),
-            'ack_only_pct': round(len(ack_only) / len(self.df) * 100, 2)
+            'ack_only_percentage': round(len(ack_only) / len(self.df) * 100, 2)
+        }
+
+    def analyze_sequence_numbers(self):
+        # Track sequence and acknowledgment numbers per flow
+        # Detects retransmissions (duplicate seq) and out-of-order delivery
+        # Calculates average window size and gap between seq numbers
+        self.df['flow'] = self.df.apply(
+            lambda r: tuple(sorted([f"{r['src_ip']}:{r['src_port']}", f"{r['dst_ip']}:{r['dst_port']}"])), axis=1
+        )
+        flows = self.df.groupby('flow')
+        retransmissions = 0
+        out_of_order = 0
+        seq_gaps = []
+        window_sizes = []
+        for _, group in flows:
+            group = group.sort_values('timestamp_ns')
+            seqs = group['seq_num'].astype(int)
+            acks = group['ack_num'].astype(int)
+            # retransmissions: duplicate sequence numbers
+            retransmissions += seqs.duplicated().sum()
+            # out-of-order: seq numbers not strictly increasing
+            out_of_order += (seqs.diff().dropna() <= 0).sum()
+            # gaps between consecutive seq numbers
+            gaps = seqs.diff().dropna()
+            seq_gaps.extend(gaps[gaps > 0].tolist())
+            # approximate window from ack-seq difference
+            window = (acks - seqs).abs()
+            window_sizes.extend(window.tolist())
+        avg_gap = float(np.mean(seq_gaps)) if seq_gaps else 0
+        avg_window = float(np.mean(window_sizes)) if window_sizes else 0
+        self.results['sequence_numbers'] = {
+            'retransmissions': int(retransmissions),
+            'out_of_order': int(out_of_order),
+            'avg_seq_gap': round(avg_gap, 1),
+            'avg_window_size': round(avg_window, 1)
         }
 
     def analyze_connections(self):
@@ -254,7 +289,7 @@ class PacketAnalyzer:
     def run(self):
         self.load_data()
         print("Running analysis...")
-        for fn in [self.analyze_latency, self.analyze_traffic_categories, self.analyze_throughput, self.analyze_tcp_flags, self.analyze_connections, self.analyze_direction]:
+        for fn in [self.analyze_latency, self.analyze_traffic_categories, self.analyze_throughput, self.analyze_tcp_flags, self.analyze_sequence_numbers, self.analyze_connections, self.analyze_direction]:
             fn()
         self.results['meta'] = {
             'input_file': self.csv_path,
