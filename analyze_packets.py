@@ -208,11 +208,12 @@ class PacketAnalyzer:
         # Count and analyze TCP flag distributions
         # Identifies PSH (data push) and ACK-only packets
         # Calculates average sizes for data and control packets
+        flag_counts = self.df['flags'].value_counts()
         pct = {k: round(v / len(self.df) * 100, 2) for k, v in flag_counts.items()}
         psh = self.df[self.df['flags'].str.contains('PSH', na=False)]
         ack_only = self.df[self.df['flags'] == 'ACK']
         self.results['tcp_flags'] = {
-            'flag_counts': flag_counts,
+            'flag_counts': flag_counts.to_dict(),
             'flag_pct': pct,
             'psh_count': int(len(psh)),
             'psh_pct': round(len(psh) / len(self.df) * 100, 2),
@@ -224,6 +225,7 @@ class PacketAnalyzer:
     def analyze_connections(self):
         # Group packets into bidirectional flows using sorted IP:port pairs
         # Calculates flow duration, packets per second, and top flows by bytes
+        self.df['flow'] = self.df.apply(
             lambda r: tuple(sorted([f"{r['src_ip']}:{r['src_port']}", f"{r['dst_ip']}:{r['dst_port']}"])), axis=1
         )
         flows = self.df.groupby('flow').agg({'size': ['count', 'sum'], 'timestamp': ['min', 'max']})
@@ -244,6 +246,7 @@ class PacketAnalyzer:
     def analyze_direction(self):
         # Analyze traffic direction by grouping source-destination IP pairs
         # Sorts by total bytes to identify dominant communication paths
+        pairs = self.df.groupby(['src_ip', 'dst_ip']).agg({'size': ['count', 'sum']})
         pairs.columns = ['packets', 'bytes']
         pairs = pairs.sort_values('bytes', ascending=False)
         self.results['direction'] = {'ip_pairs': [{'src': src, 'dst': dst, 'packets': int(row['packets']), 'bytes_kb': round(row['bytes'] / 1024, 1)} for (src, dst), row in pairs.iterrows()]}
