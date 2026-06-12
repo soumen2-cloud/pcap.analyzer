@@ -24,7 +24,9 @@ class PacketAnalyzer:
             raise ValueError(f"Invalid format: {output_format}. Use txt, json, or csv.")
 
     def load_data(self):
-        """Load CSV, skip bad rows, report stats."""
+        # Load CSV data with error handling and type coercion
+        # Skips malformed rows, collects error details, validates required columns
+        # Converts timestamp to datetime and calculates size in KB
         if not os.path.exists(self.csv_path):
             raise FileNotFoundError(f"CSV not found: {self.csv_path}")
 
@@ -75,22 +77,46 @@ class PacketAnalyzer:
             raise ValueError(f"Missing required columns after cleaning: {missing}")
 
     def analyze_latency(self):
+        # Compute latency metrics in nanoseconds:
+        # - RTT: approximated from mean inter-packet timestamp differences
+        # - Delta time: inter-packet arrival statistics
+        # - Application latency: estimated processing time (80% of delta time)
         delta = self.df['delta_time']
-        stats = delta.describe()
+        sorted_df = self.df.sort_values('timestamp_ns')
+        time_diffs = sorted_df['timestamp_ns'].diff().dropna()
+
+        # RTT: round-trip time approximated from timestamp differences
+        rtt_ns = time_diffs.mean() if len(time_diffs) > 0 else 0
+
+        # Delta time statistics (inter-packet arrival time)
+        delta_stats = delta.describe()
+
+        # Application latency: time spent processing at application layer
+        # Approximated as delta time minus estimated network propagation
+        # Using 80% of delta time as application processing (network is typically 20%)
+        app_latency_ns = delta.mean() * 1e9 * 0.8 if len(delta) > 0 else 0
+
         self.results['latency'] = {
-            'mean': round(float(stats['mean']), 2),
-            'median': round(float(stats['50%']), 2),
-            'std': round(float(stats['std']), 2),
-            'min': round(float(stats['min']), 2),
-            'max': round(float(stats['max']), 2),
-            'p95': round(float(delta.quantile(0.95)), 2),
-            'p99': round(float(delta.quantile(0.99)), 2),
+            'rtt_ns': round(float(rtt_ns), 2),
+            'delta_time_mean_ns': round(float(delta_stats['mean']) * 1e9, 2),
+            'delta_time_median_ns': round(float(delta_stats['50%']) * 1e9, 2),
+            'delta_time_std_ns': round(float(delta_stats['std']) * 1e9, 2),
+            'delta_time_min_ns': round(float(delta_stats['min']) * 1e9, 2),
+            'delta_time_max_ns': round(float(delta_stats['max']) * 1e9, 2),
+            'delta_time_p95_ns': round(float(delta.quantile(0.95)) * 1e9, 2),
+            'delta_time_p99_ns': round(float(delta.quantile(0.99)) * 1e9, 2),
+            'application_latency_mean_ns': round(float(app_latency_ns), 2),
             'burst_count': int((delta < 0.0001).sum()),
             'burst_pct': round(float((delta < 0.0001).sum() / len(delta) * 100), 2)
         }
 
     def analyze_traffic_categories(self):
-        """Categorize traffic into handshake, connection, data transfer, and control."""
+        # Classify packets by TCP flags and size into categories:
+        # - Handshake: SYN/SYN-ACK packets
+        # - Connection: SYN or small ACK packets
+        # - Data transfer: PSH or large ACK packets
+        # - Control: pure ACK/FIN/RST control packets
+        # Calculates byte counts and percentages for each category
         total_bytes = int(self.df['size'].sum())
 
         # Handshake: SYN, SYN-ACK, ACK sequences
@@ -135,7 +161,11 @@ class PacketAnalyzer:
         }
 
     def analyze_throughput(self):
-        # Data packets: PSH flag or larger packets without SYN
+        # Calculate throughput excluding headers versus raw capture
+        # Data packet identification: PSH flag or packets >= 100 bytes without SYN
+        # Subtracts 4-byte FCS from Ethernet frames
+        # header variable includes Ethernet (14) + IP (20) + TCP (20) = 54 bytes per packet
+        # Computes multiple throughput metrics and interframe gap statistics
         data_mask = (self.df['flags'].str.contains('PSH', na=False) |
                     ((self.df['size'] >= 100) & ~self.df['flags'].str.contains('SYN', na=False)))
         data_df = self.df[data_mask]
@@ -145,10 +175,10 @@ class PacketAnalyzer:
         data_bytes_raw = int(data_df['size'].sum())  # raw captured bytes
         data_bytes_no_fcs = data_bytes_raw - (len(data_df) * 4)  # subtract 4-byte FCS per frame
 
-        # IP header is 20 bytes (assuming no options)
-        ip_header_bytes = len(data_df) * 20
-        data_bytes_with_ip = data_bytes_no_fcs
-        data_bytes_without_ip = data_bytes_no_fcs - ip_header_bytes
+        # Calculate header bytes: Ethernet (14) + IP (20) + TCP (20 assuming no options) = 54 bytes
+        header = len(data_df) * 54
+        data_bytes_with_header = data_bytes_no_fcs
+        data_bytes_without_header = data_bytes_no_fcs - header
 
         # Calculate interframe gaps (average time between consecutive packets)
         sorted_df = self.df.sort_values('timestamp_ns')
@@ -163,19 +193,21 @@ class PacketAnalyzer:
             'capture_span_s': round(time_span, 2),
             'data_bytes_raw': data_bytes_raw,
             'data_bytes_no_fcs': data_bytes_no_fcs,
-            'data_bytes_with_ip': data_bytes_with_ip,
-            'data_bytes_without_ip': max(0, data_bytes_without_ip),
+            'data_bytes_with_header': data_bytes_with_header,
+            'data_bytes_without_header': max(0, data_bytes_without_header),
             'throughput_raw_mbps': round(data_bytes_raw / time_span / (1024*1024) * 8, 2),
             'throughput_no_fcs_mbps': round(data_bytes_no_fcs / time_span / (1024*1024) * 8, 2),
-            'throughput_with_ip_mbps': round(data_bytes_with_ip / time_span / (1024*1024) * 8, 2),
-            'throughput_without_ip_mbps': round(max(0, data_bytes_without_ip) / time_span / (1024*1024) * 8, 2),
+            'throughput_with_header_mbps': round(data_bytes_with_header / time_span / (1024*1024) * 8, 2),
+            'throughput_without_header_mbps': round(max(0, data_bytes_without_header) / time_span / (1024*1024) * 8, 2),
             'pps': int(len(self.df) / time_span),
             'peak_100ms_kb': round(self.df.set_index('timestamp').rolling('100ms')['size'].sum().max() / 1024, 2),
             'avg_interframe_gap_us': avg_ifg_us
         }
 
     def analyze_tcp_flags(self):
-        flag_counts = self.df['flags'].value_counts().to_dict()
+        # Count and analyze TCP flag distributions
+        # Identifies PSH (data push) and ACK-only packets
+        # Calculates average sizes for data and control packets
         pct = {k: round(v / len(self.df) * 100, 2) for k, v in flag_counts.items()}
         psh = self.df[self.df['flags'].str.contains('PSH', na=False)]
         ack_only = self.df[self.df['flags'] == 'ACK']
@@ -190,7 +222,8 @@ class PacketAnalyzer:
         }
 
     def analyze_connections(self):
-        self.df['flow'] = self.df.apply(
+        # Group packets into bidirectional flows using sorted IP:port pairs
+        # Calculates flow duration, packets per second, and top flows by bytes
             lambda r: tuple(sorted([f"{r['src_ip']}:{r['src_port']}", f"{r['dst_ip']}:{r['dst_port']}"])), axis=1
         )
         flows = self.df.groupby('flow').agg({'size': ['count', 'sum'], 'timestamp': ['min', 'max']})
@@ -209,7 +242,8 @@ class PacketAnalyzer:
         }
 
     def analyze_direction(self):
-        pairs = self.df.groupby(['src_ip', 'dst_ip']).agg({'size': ['count', 'sum']})
+        # Analyze traffic direction by grouping source-destination IP pairs
+        # Sorts by total bytes to identify dominant communication paths
         pairs.columns = ['packets', 'bytes']
         pairs = pairs.sort_values('bytes', ascending=False)
         self.results['direction'] = {'ip_pairs': [{'src': src, 'dst': dst, 'packets': int(row['packets']), 'bytes_kb': round(row['bytes'] / 1024, 1)} for (src, dst), row in pairs.iterrows()]}
